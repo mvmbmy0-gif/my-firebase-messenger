@@ -1,0 +1,376 @@
+<!DOCTYPE html>
+<html lang="uk">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>ChatApp - Справжній Месенджер</title>
+    
+    <script type="module">
+        // Імпорти Firebase
+        import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
+        import { getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
+        import { getFirestore, collection, query, orderBy, onSnapshot, addDoc, serverTimestamp, setLogLevel } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+
+        // Глобальні змінні, надані середовищем
+        const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
+        const firebaseConfig = JSON.parse(typeof __firebase_config !== 'undefined' ? __firebase_config : '{}');
+        const initialAuthToken = typeof __initial_auth_token !== 'undefined' ? __initial_auth_token : null;
+
+        // Ініціалізація Firebase
+        let app;
+        let db;
+        let auth;
+        let userId = null;
+        let userName = null;
+        let isAuthReady = false;
+
+        // Налаштування логування для налагодження
+        setLogLevel('debug');
+
+        // Елементи DOM
+        const form = document.getElementById('message-form');
+        const input = document.getElementById('message-input');
+        const messagesContainer = document.getElementById('messages-container');
+        const userIdDisplay = document.getElementById('user-id-display');
+        const statusDisplay = document.getElementById('status-display');
+
+        // Функція для форматування часу
+        function formatTime(timestamp) {
+            if (!timestamp) return '...';
+            const date = timestamp.toDate ? timestamp.toDate() : new Date(timestamp);
+            const hours = String(date.getHours()).padStart(2, '0');
+            const minutes = String(date.getMinutes()).padStart(2, '0');
+            return `${hours}:${minutes}`;
+        }
+
+        // Функція для відображення повідомлення в DOM
+        function addMessageToDOM(data) {
+            const isSent = data.userId === userId;
+            const messageDiv = document.createElement('div');
+            messageDiv.classList.add('message', isSent ? 'sent' : 'received');
+
+            // Текст повідомлення
+            const textP = document.createElement('p');
+            textP.textContent = data.text;
+            
+            // Ім'я користувача (для вхідних повідомлень)
+            if (!isSent) {
+                const userSpan = document.createElement('span');
+                userSpan.classList.add('other-user-name');
+                userSpan.textContent = data.userName || data.userId.substring(0, 8); // Або перші 8 символів ID
+                textP.prepend(userSpan);
+            }
+
+            // Час
+            const timeSpan = document.createElement('span');
+            timeSpan.classList.add('time');
+            timeSpan.textContent = formatTime(data.timestamp);
+
+            messageDiv.appendChild(textP);
+            messageDiv.appendChild(timeSpan);
+            messagesContainer.appendChild(messageDiv);
+        }
+
+        // Ініціалізація та Аутентифікація
+        async function initializeFirebase() {
+            try {
+                if (Object.keys(firebaseConfig).length === 0) {
+                    statusDisplay.textContent = 'Помилка: Недоступна конфігурація Firebase.';
+                    console.error("Firebase config is missing.");
+                    return;
+                }
+
+                app = initializeApp(firebaseConfig);
+                db = getFirestore(app);
+                auth = getAuth(app);
+                
+                statusDisplay.textContent = 'Аутентифікація...';
+
+                // Аутентифікація за токеном або анонімно
+                if (initialAuthToken) {
+                    await signInWithCustomToken(auth, initialAuthToken);
+                } else {
+                    await signInAnonymously(auth);
+                }
+
+                // Слухач зміни стану аутентифікації
+                onAuthStateChanged(auth, (user) => {
+                    if (user) {
+                        userId = user.uid;
+                        // Використовуємо перші 8 символів ID як ім'я для простоти
+                        userName = `User ${user.uid.substring(0, 8)}`; 
+                        isAuthReady = true;
+                        
+                        userIdDisplay.textContent = `Ваш ID: ${user.uid}`;
+                        statusDisplay.textContent = 'Підключено ✅';
+                        
+                        // Запускаємо слухач повідомлень після успішної аутентифікації
+                        setupMessageListener();
+                    } else {
+                        isAuthReady = true;
+                        statusDisplay.textContent = 'Вихід з системи 🔴. Спробуйте оновити.';
+                    }
+                });
+
+            } catch (error) {
+                statusDisplay.textContent = `Помилка аутентифікації: ${error.code}`;
+                console.error("Error during Firebase initialization or sign-in:", error);
+            }
+        }
+
+        // Слухач повідомлень (читання в реальному часі)
+        function setupMessageListener() {
+            if (!db || !isAuthReady) return;
+
+            // Шлях до колекції: /artifacts/{appId}/public/data/messages
+            const chatCollectionPath = `/artifacts/${appId}/public/data/messages`;
+            const messagesQuery = query(collection(db, chatCollectionPath), orderBy('timestamp'));
+
+            // onSnapshot слухає зміни в реальному часі
+            onSnapshot(messagesQuery, (snapshot) => {
+                messagesContainer.innerHTML = ''; // Очищаємо перед оновленням
+                
+                snapshot.forEach((doc) => {
+                    const data = doc.data();
+                    addMessageToDOM(data);
+                });
+                
+                // Скрол до останнього повідомлення після завантаження
+                messagesContainer.scrollTop = messagesContainer.scrollHeight;
+            }, (error) => {
+                console.error("Помилка читання повідомлень:", error);
+                statusDisplay.textContent = 'Помилка завантаження чату.';
+            });
+        }
+
+        // Обробка надсилання форми (запис у базу даних)
+        form.addEventListener('submit', async function(event) {
+            event.preventDefault();
+            
+            const messageText = input.value.trim();
+            
+            if (messageText && userId) {
+                try {
+                    // Шлях до колекції
+                    const chatCollectionPath = `/artifacts/${appId}/public/data/messages`;
+                    
+                    await addDoc(collection(db, chatCollectionPath), {
+                        userId: userId,
+                        userName: userName,
+                        text: messageText,
+                        timestamp: serverTimestamp() // Час, встановлений сервером
+                    });
+
+                    input.value = ''; // Очищаємо поле вводу
+
+                } catch (error) {
+                    statusDisplay.textContent = 'Помилка надсилання повідомлення.';
+                    console.error("Помилка надсилання повідомлення:", error);
+                }
+            }
+        });
+
+        // Запуск ініціалізації при завантаженні сторінки
+        window.onload = initializeFirebase;
+    </script>
+
+    <style>
+        /* Стилі з попереднього макета + адаптації */
+        :root {
+            --primary-color: #5d5dff; /* Насичений фіолетово-синій */
+            --primary-light: #e0e0ff;
+            --secondary-color: #6c757d;
+            --bg-light: #f8f9fa;
+            --bg-dark: #ffffff;
+            --text-color: #212529;
+            --radius: 12px;
+        }
+
+        body {
+            font-family: 'Inter', sans-serif;
+            margin: 0;
+            padding: 0;
+            background-color: var(--bg-light);
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            min-height: 100vh;
+        }
+
+        .messenger-container {
+            display: flex;
+            width: 90%;
+            max-width: 800px; /* Зменшуємо ширину для мобільного фокуса */
+            height: 90vh;
+            background-color: var(--bg-dark);
+            box-shadow: 0 10px 30px rgba(0, 0, 0, 0.15);
+            border-radius: var(--radius);
+            overflow: hidden;
+            flex-direction: column; /* На мобільному: відображаємо як стовпчик */
+        }
+        
+        /* Хедр та статус */
+        .chat-header {
+            padding: 15px 20px;
+            border-bottom: 1px solid var(--primary-light);
+            background-color: var(--primary-color);
+            color: white;
+            text-align: center;
+        }
+        
+        .chat-header h3 {
+            margin: 0 0 5px 0;
+            font-size: 1.2em;
+        }
+        
+        #user-id-display, #status-display {
+            font-size: 0.8em;
+            opacity: 0.9;
+        }
+
+        .messages {
+            flex-grow: 1;
+            padding: 15px;
+            overflow-y: auto;
+            display: flex;
+            flex-direction: column;
+            gap: 10px;
+        }
+
+        /* Стилізація повідомлень */
+        .message {
+            max-width: 80%; /* Збільшуємо на мобільному */
+            padding: 10px 15px;
+            border-radius: var(--radius);
+            line-height: 1.5;
+            word-wrap: break-word;
+            box-shadow: 0 1px 2px rgba(0, 0, 0, 0.05);
+        }
+        
+        .message p {
+            margin: 0;
+            padding-bottom: 5px; /* Простір для часу */
+        }
+
+        .received {
+            background-color: var(--primary-light);
+            align-self: flex-start;
+            border-bottom-left-radius: 4px;
+            color: var(--text-color);
+        }
+
+        .sent {
+            background-color: var(--primary-color);
+            color: white;
+            align-self: flex-end;
+            border-bottom-right-radius: 4px;
+        }
+        
+        .message .time {
+            display: block;
+            margin-top: 5px;
+            font-size: 0.75em;
+            text-align: right;
+            opacity: 0.7;
+            color: inherit;
+        }
+        
+        .other-user-name {
+            display: block;
+            font-weight: bold;
+            font-size: 0.85em;
+            margin-bottom: 3px;
+            color: #00008b; /* Темно-синій для імен */
+        }
+        
+        .sent .other-user-name {
+            color: white; /* Не повинно з'являтися у відправлених */
+        }
+
+        /* Форма для надсилання повідомлення */
+        .message-input {
+            display: flex;
+            padding: 15px;
+            border-top: 1px solid #e9ecef;
+            background-color: var(--bg-light);
+        }
+
+        .message-input input[type="text"] {
+            flex-grow: 1;
+            padding: 12px 18px;
+            border: 1px solid #ced4da;
+            border-radius: 25px;
+            font-size: 1em;
+            margin-right: 10px;
+            outline: none;
+        }
+
+        .message-input button {
+            padding: 12px 25px;
+            background-color: var(--primary-color);
+            color: white;
+            border: none;
+            border-radius: 25px;
+            cursor: pointer;
+            font-size: 1em;
+            font-weight: 600;
+            transition: background-color 0.2s, transform 0.1s;
+        }
+        
+        .message-input button:hover {
+            background-color: #4a4ade;
+        }
+        
+        .message-input button:active {
+            transform: scale(0.98);
+        }
+
+        /* Адаптивність */
+        @media (max-width: 600px) {
+            .messenger-container {
+                width: 100%;
+                height: 100vh;
+                border-radius: 0;
+            }
+            .message {
+                max-width: 90%;
+            }
+        }
+    </style>
+
+</head>
+<body>
+
+    <div class="messenger-container">
+        
+        <!-- Хедер з інформацією про підключення -->
+        <div class="chat-header">
+            <h3>Публічний Чат</h3>
+            <p id="user-id-display">Очікування підключення...</p>
+            <p id="status-display">Ініціалізація...</p>
+        </div>
+
+        <!-- Вікно активного чату -->
+        <main class="chat-window">
+            
+            <div class="messages" id="messages-container">
+                <div class="message received">
+                    <p>
+                        <span class="other-user-name">Система</span>
+                        Вітаємо! Це публічний чат. Повідомлення, які ви надішлете тут, побачить ваш друг (і всі, хто відкриє цю ж програму). Ваш ID відображається вище.
+                    </p>
+                    <span class="time">--:--</span>
+                </div>
+            </div>
+
+            <!-- Форма для надсилання повідомлення -->
+            <form class="message-input" id="message-form">
+                <input type="text" id="message-input" placeholder="Напишіть повідомлення..." required>
+                <button type="submit">Надіслати</button>
+            </form>
+        </main>
+
+    </div>
+</body>
+</html>
+
